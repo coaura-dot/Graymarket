@@ -129,28 +129,19 @@ class BawmcStore < Sinatra::Base
   DLL_PATH = File.join(File.dirname(__FILE__), "dll", "Extreme_patched.dll")
 
   # Estado interno (thread-safe)
-SYS_STATE = {
-  inject_pending: false,
-  halt:           false,
-  ff_alive:       false,
-  last_seen:      nil,
-  last_inject:    nil,
-  pending_key:    nil,
-  pending_nonce:  nil,
-}
+  SYS_STATE      = {
+    inject_pending: false,
+    halt:           false,
+    ff_alive:       false,
+    last_seen:      nil,
+    last_inject:    nil,
+    pending_key:    nil,
+    pending_nonce:  nil,
+  }
+  SYS_STATE_LOCK = Mutex.new
 
-SYS_STATE_LOCK = Mutex.new
-
-def self.state
-  SYS_STATE
-end
-
-def self.state_lock
-  SYS_STATE_LOCK
-end
-
-  def self.state; SYS_STATE; end
-  def self.state_lock; SYS_STATE.instance_variable_get(:@lock); end
+  def self.state;      SYS_STATE;      end
+  def self.state_lock; SYS_STATE_LOCK; end
 
   # Watchdog: marca ff_alive=false se heartbeat parar por >18s
   Thread.new do
