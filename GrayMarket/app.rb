@@ -129,15 +129,25 @@ class BawmcStore < Sinatra::Base
   DLL_PATH = File.join(File.dirname(__FILE__), "dll", "Extreme_patched.dll")
 
   # Estado interno (thread-safe)
-  SYS_STATE = {
-    inject_pending: false,
-    halt:           false,
-    ff_alive:       false,
-    last_seen:      nil,
-    last_inject:    nil,
-    pending_key:    nil,   # ChaCha20 key (32 bytes) gerado na ativação
-    pending_nonce:  nil,   # nonce (12 bytes) gerado na ativação
-  }.freeze.tap { |h| h.instance_variable_set(:@lock, Mutex.new) }
+SYS_STATE = {
+  inject_pending: false,
+  halt:           false,
+  ff_alive:       false,
+  last_seen:      nil,
+  last_inject:    nil,
+  pending_key:    nil,
+  pending_nonce:  nil,
+}
+
+SYS_STATE_LOCK = Mutex.new
+
+def self.state
+  SYS_STATE
+end
+
+def self.state_lock
+  SYS_STATE_LOCK
+end
 
   def self.state; SYS_STATE; end
   def self.state_lock; SYS_STATE.instance_variable_get(:@lock); end
