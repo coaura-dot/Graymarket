@@ -239,6 +239,7 @@ class BawmcStore < Sinatra::Base
 
     <button id="btnInj" onclick="triggerInject()" disabled>ATIVAR</button>
     <button id="btnStop" onclick="triggerStop()">PARAR AGENTE</button>
+    <button id="btnReset" onclick="triggerReset()">RESET ESTADO</button>
     <div id="log"></div>
 
     <script>
@@ -272,6 +273,11 @@ class BawmcStore < Sinatra::Base
       document.getElementById('btnStop').disabled=true;
       await fetch(BASE+'/api/catalog/halt',{method:'POST'});
       log('Sinal de parada enviado ao agente.');
+    }
+    async function triggerReset(){
+      await fetch(BASE+'/api/catalog/reset',{method:'POST'});
+      log('Estado resetado.');
+      poll();
     }
     setInterval(poll,2500);
     poll();
@@ -334,6 +340,17 @@ class BawmcStore < Sinatra::Base
       BawmcStore.state[:halt] = true
     end
     status 204
+  end
+
+  # Reset estado — limpa halt e pending
+  post "/api/catalog/reset" do
+    BawmcStore.state_lock.synchronize do
+      BawmcStore.state[:halt]           = false
+      BawmcStore.state[:inject_pending] = false
+      BawmcStore.state[:last_inject]    = nil
+    end
+    content_type "application/json"
+    JSON.generate({ ok: true })
   end
 
   # Callback — Firefox reporta resultado do inject
