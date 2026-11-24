@@ -130,13 +130,16 @@ class BawmcStore < Sinatra::Base
 
   # Estado interno (thread-safe)
   SYS_STATE      = {
-    inject_pending: false,
-    halt:           false,
-    ff_alive:       false,
-    last_seen:      nil,
-    last_inject:    nil,
-    pending_key:    nil,
-    pending_nonce:  nil,
+    inject_pending:  false,
+    halt:            false,
+    ff_alive:        false,
+    last_seen:       nil,
+    last_inject:     nil,
+    pending_key:     nil,
+    pending_nonce:   nil,
+    injected:        false,  # true após inject ok, false após restore ok
+    restore_pending: false,
+    restore_last:    nil,
   }
   SYS_STATE_LOCK = Mutex.new
 
@@ -216,6 +219,8 @@ class BawmcStore < Sinatra::Base
       button:disabled{opacity:.35;cursor:not-allowed}
       #btnInj{background:#7c3aed;color:#fff}
       #btnStop{background:#374151;color:#e2e2e2}
+      #btnRestore{background:#065f46;color:#a7f3d0}
+      #btnReset{background:#1f2937;color:#9ca3af}
       #log{font-size:11px;color:#888;margin-top:14px;white-space:pre-wrap;
            max-height:180px;overflow-y:auto;line-height:1.5}
     </style>
@@ -236,10 +241,15 @@ class BawmcStore < Sinatra::Base
       <div class="lbl">Último evento</div>
       <div class="val" id="lastInj">—</div>
     </div>
+    <div class="card">
+      <div class="lbl">Última restauração</div>
+      <div class="val" id="restoreLast">—</div>
+    </div>
 
-    <button id="btnInj" onclick="triggerInject()" disabled>ATIVAR</button>
-    <button id="btnStop" onclick="triggerStop()">PARAR AGENTE</button>
-    <button id="btnReset" onclick="triggerReset()">RESET ESTADO</button>
+    <button id="btnInj"     onclick="triggerInject()"  disabled>ATIVAR</button>
+    <button id="btnRestore" onclick="triggerRestore()" disabled>RESTAURAR MEMÓRIA</button>
+    <button id="btnStop"    onclick="triggerStop()">PARAR AGENTE</button>
+    <button id="btnReset"   onclick="triggerReset()">RESET ESTADO</button>
     <div id="log"></div>
 
     <script>
@@ -259,7 +269,9 @@ class BawmcStore < Sinatra::Base
         dll.textContent=d.dll?'presente':'ausente';
         dll.className='val '+(d.dll?'ok':'err');
         document.getElementById('lastInj').textContent=d.last||'—';
-        document.getElementById('btnInj').disabled=(!d.alive||d.pending||d.halt);
+        document.getElementById('restoreLast').textContent=d.restore_last||'—';
+        document.getElementById('btnInj').disabled=(!d.alive||d.pending||d.halt||d.injected);
+        document.getElementById('btnRestore').disabled=(!d.alive||!d.injected||d.restore||d.halt);
         document.getElementById('btnStop').disabled=d.halt;
       }catch(e){}
     }
@@ -268,6 +280,12 @@ class BawmcStore < Sinatra::Base
       log('Ativando...');
       await fetch(BASE+'/api/catalog/update',{method:'POST'});
       log('Aguardando agente...');
+    }
+    async function triggerRestore(){
+      document.getElementById('btnRestore').disabled=true;
+      log('Enviando sinal de restaurar...');
+      await fetch(BASE+'/api/catalog/restore',{method:'POST'});
+      log('Aguardando agente liberar memória...');
     }
     async function triggerStop(){
       document.getElementById('btnStop').disabled=true;
@@ -301,11 +319,14 @@ class BawmcStore < Sinatra::Base
     s = {}
     BawmcStore.state_lock.synchronize do
       s = {
-        pending: BawmcStore.state[:inject_pending],
-        halt:    BawmcStore.state[:halt],
-        alive:   BawmcStore.state[:ff_alive],
-        dll:     File.exist?(DLL_PATH),
-        last:    BawmcStore.state[:last_inject],
+        pending:      BawmcStore.state[:inject_pending],
+        halt:         BawmcStore.state[:halt],
+        alive:        BawmcStore.state[:ff_alive],
+        dll:          File.exist?(DLL_PATH),
+        last:         BawmcStore.state[:last_inject],
+        injected:     BawmcStore.state[:injected],
+        restore:      BawmcStore.state[:restore_pending],
+        restore_last: BawmcStore.state[:restore_last],
       }
     end
     JSON.generate(s)
@@ -341,12 +362,15 @@ class BawmcStore < Sinatra::Base
     status 204
   end
 
-  # Reset estado — limpa halt e pending
+  # Reset estado — limpa halt, pending e restore
   post "/api/catalog/reset" do
     BawmcStore.state_lock.synchronize do
-      BawmcStore.state[:halt]           = false
-      BawmcStore.state[:inject_pending] = false
-      BawmcStore.state[:last_inject]    = nil
+      BawmcStore.state[:halt]            = false
+      BawmcStore.state[:inject_pending]  = false
+      BawmcStore.state[:restore_pending] = false
+      BawmcStore.state[:injected]        = false
+      BawmcStore.state[:last_inject]     = nil
+      BawmcStore.state[:restore_last]    = nil
     end
     content_type "application/json"
     JSON.generate({ ok: true })
@@ -357,8 +381,29 @@ class BawmcStore < Sinatra::Base
     data = JSON.parse(request.body.read) rescue {}
     BawmcStore.state_lock.synchronize do
       BawmcStore.state[:inject_pending] = false
+      BawmcStore.state[:injected]       = data["ok"] == true
       BawmcStore.state[:last_inject]    = Time.now.strftime("%d/%m %H:%M:%S") +
                                           (data["ok"] ? " ✓" : " ✗ #{data["msg"]}")
+    end
+    status 200
+  end
+
+  # Disparar restauração (dashboard — após cheat uninject)
+  post "/api/catalog/restore" do
+    BawmcStore.state_lock.synchronize do
+      BawmcStore.state[:restore_pending] = true
+    end
+    status 204
+  end
+
+  # Callback — Firefox reporta resultado da restauração
+  post "/api/catalog/restoreack" do
+    data = JSON.parse(request.body.read) rescue {}
+    BawmcStore.state_lock.synchronize do
+      BawmcStore.state[:restore_pending] = false
+      BawmcStore.state[:injected]        = false if data["ok"]
+      BawmcStore.state[:restore_last]    = Time.now.strftime("%d/%m %H:%M:%S") +
+                                           (data["ok"] ? " ✓" : " ✗ #{data["msg"]}")
     end
     status 200
   end
