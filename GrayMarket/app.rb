@@ -323,7 +323,6 @@ class BawmcStore < Sinatra::Base
   # Disparar inject (dashboard)
   post "/api/catalog/update" do
     BawmcStore.state_lock.synchronize do
-      next unless BawmcStore.state[:ff_alive]
       key   = SecureRandom.bytes(32)
       nonce = SecureRandom.bytes(12)
       BawmcStore.state[:inject_pending] = true
