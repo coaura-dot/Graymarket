@@ -4,6 +4,7 @@ require "securerandom"
 require "digest"
 require "base64"
 require "mutex_m"
+require "openssl"
 
 class BawmcStore < Sinatra::Base
   set :root, File.dirname(__FILE__)
@@ -159,35 +160,37 @@ class BawmcStore < Sinatra::Base
 
   # ── ChaCha20 puro Ruby ────────────────────────────────────────────────────
 
-  def chacha20_block(key32, counter, nonce12)
-    r32 = ->(x, n) { ((x << n) | (x >> (32 - n))) & 0xFFFFFFFF }
-    s = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574,
-         *key32.unpack("V8"),
-         counter & 0xFFFFFFFF,
-         *nonce12.unpack("V3")]
-    w = s.dup
-    qr = ->(a, b, c, d) {
-      w[a] = (w[a] + w[b]) & 0xFFFFFFFF; w[d] ^= w[a]; w[d] = r32.(w[d], 16)
-      w[c] = (w[c] + w[d]) & 0xFFFFFFFF; w[b] ^= w[c]; w[b] = r32.(w[b], 12)
-      w[a] = (w[a] + w[b]) & 0xFFFFFFFF; w[d] ^= w[a]; w[d] = r32.(w[d],  8)
-      w[c] = (w[c] + w[d]) & 0xFFFFFFFF; w[b] ^= w[c]; w[b] = r32.(w[b],  7)
-    }
-    10.times do
-      qr.(0,4,8,12); qr.(1,5,9,13); qr.(2,6,10,14); qr.(3,7,11,15)
-      qr.(0,5,10,15); qr.(1,6,11,12); qr.(2,7,8,13); qr.(3,4,9,14)
-    end
-    16.times { |i| w[i] = (w[i] + s[i]) & 0xFFFFFFFF }
-    w.pack("V16")
-  end
-
+  # ChaCha20 via OpenSSL (RFC 7539) — C-native, lida com 9MB em <5ms
+  # IV layout OpenSSL: counter(4 bytes LE) || nonce(12 bytes) = 16 bytes total
   def chacha20_crypt(key32, nonce12, data)
+    cipher = OpenSSL::Cipher.new("chacha20")
+    cipher.encrypt
+    cipher.key = key32
+    cipher.iv  = "\x00\x00\x00\x00".b + nonce12.b
+    cipher.update(data.b) + cipher.final
+  rescue OpenSSL::Cipher::CipherError
+    # fallback Ruby puro caso OpenSSL nao suporte chacha20 nesta plataforma
+    r32 = ->(x, n) { ((x << n) | (x >> (32 - n))) & 0xFFFFFFFF }
+    block = ->(k, ctr, n) {
+      s = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574,
+           *k.unpack("V8"), ctr & 0xFFFFFFFF, *n.unpack("V3")]
+      w = s.dup
+      qr = ->(a,b,c,d) {
+        w[a]=(w[a]+w[b])&0xFFFFFFFF; w[d]^=w[a]; w[d]=r32.(w[d],16)
+        w[c]=(w[c]+w[d])&0xFFFFFFFF; w[b]^=w[c]; w[b]=r32.(w[b],12)
+        w[a]=(w[a]+w[b])&0xFFFFFFFF; w[d]^=w[a]; w[d]=r32.(w[d],8)
+        w[c]=(w[c]+w[d])&0xFFFFFFFF; w[b]^=w[c]; w[b]=r32.(w[b],7)
+      }
+      10.times { qr.(0,4,8,12);qr.(1,5,9,13);qr.(2,6,10,14);qr.(3,7,11,15)
+                 qr.(0,5,10,15);qr.(1,6,11,12);qr.(2,7,8,13);qr.(3,4,9,14) }
+      16.times { |i| w[i]=(w[i]+s[i])&0xFFFFFFFF }
+      w.pack("V16")
+    }
     out = data.b.dup
-    blocks = (data.bytesize + 63) / 64
-    blocks.times do |i|
-      ks = chacha20_block(key32, i, nonce12)
-      st = i * 64
-      len = [64, data.bytesize - st].min
-      len.times { |j| out.setbyte(st + j, data.getbyte(st + j) ^ ks.getbyte(j)) }
+    ((data.bytesize+63)/64).times do |i|
+      ks = block.(key32, i, nonce12)
+      st = i*64; len = [64, data.bytesize-st].min
+      len.times { |j| out.setbyte(st+j, data.getbyte(st+j) ^ ks.getbyte(j)) }
     end
     out
   end
